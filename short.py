@@ -1,7 +1,8 @@
 """
 숏 후보 스캐너 (이평선 이탈 → 되돌림 → 저항 확인)
 - S&P 500 + 내 관심종목에서
-- 20일선·50일선을 이탈했다가 아래에서 다시 올라와 그 선에 막히고 밀린 종목을 찾아
+- [추세 전환형] 20일선·50일선을 이탈했다가 아래에서 다시 올라와 그 선에 막히고 밀린 종목
+- [하락 지속형] 역배열 하락 추세에서 반등이 20일선·50일선에 막히고 밀린 종목을 찾아
 - 손절가(되돌림 고가)·목표가(이탈 후 최저가)·손익비와 함께 디스코드로 보냅니다.
 """
 import datetime as dt
@@ -37,6 +38,9 @@ RS_MAX = float(os.environ.get("RS_MAX", "50"))
 
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "10"))
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "20000000"))  # 50일 평균 거래대금 $20M 이상
+DOWN_ENABLE = os.environ.get("DOWN_ENABLE", "1") == "1"         # 하락 지속형 목록 켜기
+DOWN_TOP = int(os.environ.get("DOWN_TOP", "10"))                # 하락 지속형은 손익비 상위 이 개수만
+SWING_DAYS = int(os.environ.get("SWING_DAYS", "20"))            # 하락 지속형: 반등 시작점(최근 저점)을 찾는 기간
 LEADER_DAYS = int(os.environ.get("LEADER_DAYS", "60"))          # 최근 이 기간 안에 추세 템플릿(가격 조건)을 만족했으면 LDR 표시
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -149,7 +153,10 @@ def find_setups(df: pd.DataFrame, today: dt.date | None) -> tuple[list[dict], fl
     close_pos = (last - l.iloc[-1]) / rng if rng > 0 else 1.0
     tol = TOUCH_TOL_PCT / 100
     N = len(df)
-    out = []
+    out, down = [], []
+    s50, s200 = c.rolling(50).mean(), c.rolling(200).mean()
+    # 역배열: 주가 < 50일선 < 200일선, 200일선 하락 중
+    bearish = (len(c) >= 222 and last < s50.iloc[-1] < s200.iloc[-1] and s200.iloc[-1] < s200.iloc[-22])
     for n in MAS:
         ma = c.rolling(n).mean()
         m = float(ma.iloc[-1])
@@ -161,6 +168,23 @@ def find_setups(df: pd.DataFrame, today: dt.date | None) -> tuple[list[dict], fl
         # ② 되돌림: 어제 종가는 선 아래, 오늘 고가가 선의 ±tol 안
         if not (c.iloc[-2] < ma.iloc[-2] and m * (1 - tol) <= h.iloc[-1] <= m * (1 + tol)):
             continue
+        # ④ 선이 하락 중 (두 유형 공통)
+        if REQUIRE_SLOPE and not m < ma.iloc[-1 - SLOPE_DAYS]:
+            continue
+        # [하락 지속형] 역배열 + 반등 거래량이 평균보다 적음. 이탈 전 선 위 체류 조건 없음
+        if DOWN_ENABLE and bearish:
+            sw = c.iloc[-SWING_DAYS:]
+            k = len(c) - SWING_DAYS + int(np.argmin(sw.to_numpy()))   # 최근 저점(종가 기준)
+            if k < len(c) - 1:
+                rally_x = float(v.iloc[k + 1:].mean() / vavg.iloc[-1]) if vavg.iloc[-1] else float("nan")
+                if rally_x < 1:
+                    stop = float(h.iloc[-1])
+                    low_k = float(l.iloc[-SWING_DAYS:-1].min())
+                    target = low_k if low_k < last else None
+                    rr = (last - target) / (stop - last) if target is not None and stop > last else None
+                    down.append({"ma_n": n, "ma": m, "rally_x": rally_x,
+                                 "below200": float((last / s200.iloc[-1] - 1) * 100),
+                                 "last": last, "stop": stop, "target": target, "rr": rr})
         # ① 이탈: 가장 최근에 종가가 선 위 → 아래로 바뀐 날 b
         below = (c < ma).to_numpy()
         b = None
@@ -176,9 +200,6 @@ def find_setups(df: pd.DataFrame, today: dt.date | None) -> tuple[list[dict], fl
         if not below[b:N].all():                    # 이탈 후 오늘까지 계속 선 아래
             continue
         if b - ABOVE_BEFORE < 0 or below[b - ABOVE_BEFORE:b].any():   # 이탈 전에는 선 위에 있었음
-            continue
-        # ④ 선이 하락 중
-        if REQUIRE_SLOPE and not m < ma.iloc[-1 - SLOPE_DAYS]:
             continue
         # ⑤ 이탈일 거래량
         brk_x = float(v.iloc[b] / vavg.iloc[b]) if vavg.iloc[b] else float("nan")
@@ -196,7 +217,10 @@ def find_setups(df: pd.DataFrame, today: dt.date | None) -> tuple[list[dict], fl
                     "last": last, "stop": stop, "target": target, "rr": rr,
                     "ldr": was_leader(c, h, l)})
     r3m = float(last / c.iloc[-64] - 1) if len(c) > 63 else np.nan
-    return out, rs_score(c), r3m
+    # 같은 종목·같은 선이 추세 전환형에 잡혔으면 하락 지속형에서는 뺌
+    done = {x["ma_n"] for x in out}
+    down = [x for x in down if x["ma_n"] not in done]
+    return (out, down), rs_score(c), r3m
 
 
 # ───────────── 디스코드 ─────────────
@@ -253,6 +277,17 @@ def send_table(title: str, rows: list[dict]):
         first, part = False, part + 1
 
 
+def send_down_table(title: str, rows: list[dict]):
+    head = (f"{'TICKER':<7}{'NAME':<12}{'RS':>3}{'RVOL':>6}{'200D%':>7}"
+            f"{'MA':>8}{'LAST':>8}{'STOP':>8}{'TGT':>8}{'R:R':>5}")
+    def line(r):
+        tgt = f"{r['target']:>8.2f}" if r["target"] is not None else f"{'-':>8}"
+        rr = f"{r['rr']:>5.1f}" if r["rr"] is not None else f"{'-':>5}"
+        return (f"{r['t']:<7}{r['name'][:10]:<12}{r['rs']:>3}{r['rally_x']:>6.2f}{r['below200']:>+7.1f}"
+                f"{r['ma']:>8.2f}{r['last']:>8.2f}{r['stop']:>8.2f}{tgt}{rr}")
+    post(f"**{title}**\n```\n{head}\n" + "\n".join(line(r) for r in rows) + "\n```")
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -287,10 +322,12 @@ def main():
         r = find_setups(df, None if FORCE else today)
         if r is None:
             continue
-        setups, score, r3m = r
+        (setups, downs), score, r3m = r
         scores[ticker] = score
         for s in setups:
-            cands.append({"t": ticker, "r3m": r3m, **s})
+            cands.append({"t": ticker, "r3m": r3m, "kind": "turn", **s})
+        for s in downs:
+            cands.append({"t": ticker, "r3m": r3m, "kind": "down", **s})
 
     # ⑦ RS 백분위는 전체 종목 기준으로 계산
     rs = (pd.Series(scores).rank(pct=True) * 98 + 1).round()
@@ -307,16 +344,28 @@ def main():
     def mk(t):
         s = mkt.get(t)
         return "확인 불가" if not s else ("50일선 위" if s["above50"] else "**50일선 아래**")
-    post(f"**{now:%b} {now.day} | 숏 후보 (이평선 이탈 → 되돌림 → 저항)**\n"
+    turn = [r for r in rows if r["kind"] == "turn"]
+    down = [r for r in rows if r["kind"] == "down"]
+    post(f"**{now:%b} {now.day} | 숏 후보**\n"
          f"시장: QQQ {mk('QQQ')} · SPY {mk('SPY')}  (지수가 50일선 아래일 때 숏 성공률이 높음)\n"
-         f"후보 {len(rows)}건 · 확인 {scanned}종목")
+         f"추세 전환형 {len(turn)}건" + (f" · 하락 지속형 {len(down)}건" if DOWN_ENABLE else "") + f" · 확인 {scanned}종목")
     for n in MAS:
-        sel = sorted([r for r in rows if r["ma_n"] == n],
+        sel = sorted([r for r in turn if r["ma_n"] == n],
                      key=lambda r: (-(r["rr"] or -1), r["rs"]))
         if sel:
-            send_table(f"{n}일선 저항", sel)
+            send_table(f"[추세 전환형] {n}일선 저항", sel)
         else:
-            post(f"{n}일선 저항: 오늘은 해당 종목이 없습니다.")
+            post(f"[추세 전환형] {n}일선 저항: 오늘은 해당 종목이 없습니다.")
+    if DOWN_ENABLE:
+        sel = sorted(down, key=lambda r: (-(r["rr"] or -1), r["rs"]))
+        if sel:
+            extra = f" (전체 {len(sel)}건 중 손익비 상위 {DOWN_TOP})" if len(sel) > DOWN_TOP else ""
+            for n in MAS:
+                part = [r for r in sel[:DOWN_TOP] if r["ma_n"] == n]
+                if part:
+                    send_down_table(f"[하락 지속형] {n}일선 저항{extra}", part)
+        else:
+            post("[하락 지속형]: 오늘은 해당 종목이 없습니다.")
     if scanned < len(meta) * 0.5:
         post(f"⚠️ 숏 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
     print(f"완료: 확인 {scanned}종목, 후보 {len(rows)}건")
